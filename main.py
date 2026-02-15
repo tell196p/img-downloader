@@ -4,6 +4,7 @@ import time
 import json
 import hashlib
 import datetime as dt
+import html
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -18,12 +19,246 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+)
+from selenium.webdriver.common.action_chains import ActionChains
 
 
 LOGIN_MENU_URL = "https://parents.codmon.com/menu"
 HOME_URL = "https://parents.codmon.com/home"
 IMG_HOST_PREFIX = "https://image.codmon.com/"  # 安全フィルタ用
+
+_MD_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_REL_RE = re.compile(r"(\d+)\s*(分|時間)\s*前")
+
+def group_images_by_date(detail_html: str, now_dt, fallback_date=None):
+    """DetailページHTMLから画像URLを抽出し、日付ごとにグルーピングして返す。
+    - このスクリプトの仕様上、Detailページは「1つのカード（＝1日）」に対応する前提。
+    - そのため、日付はまず detail_html 内の表示日付を探し、見つからなければ fallback_date を使う。
+    戻り値: {date: [url, ...]}
+    """
+    try:
+        base_date = None
+        # 1) detail側に表示されている日付を探す（例: "1月23日", "2026/01/23" など）
+        soup = BeautifulSoup(detail_html or "", "html.parser")
+        text_candidates = []
+        for sel in [
+            ".diaryHeader__date", ".diary__date", ".diaryDate", ".detail__date",
+            ".homeCard_date", "div.homeCard_date", "span.homeCard_date",
+            ".diaryShow__date", ".diaryShowHeader__date"
+        ]:
+            for el in soup.select(sel):
+                t = (el.get_text(" ", strip=True) or "").replace("\u3000", " ")
+                if t:
+                    text_candidates.append(t)
+
+        # 画面に日付が無い場合、タイトルや本文先頭に含まれることもあるので広めに拾う
+        if not text_candidates:
+            # head/title
+            if soup.title and soup.title.string:
+                text_candidates.append(soup.title.string.strip())
+            # visible text (限定的に)
+            body_text = soup.get_text(" ", strip=True)
+            if body_text:
+                text_candidates.append(body_text[:300])
+
+        for t in text_candidates:
+            # 既存の human_time_to_dt が利用できればそれを使う（"1月23日" なども処理できる前提）
+            try:
+                dt_ = human_time_to_dt(t)
+                if dt_:
+                    base_date = dt_.date()
+                    break
+            except Exception:
+                pass
+
+        if base_date is None:
+            if fallback_date is not None:
+                base_date = fallback_date
+            else:
+                base_date = now_dt.date() if hasattr(now_dt, "date") else dt.datetime.now().date()
+
+        # 2) 画像URL抽出（img/src, img/data-src, a/href を対象）
+        urls = []
+        for img in soup.find_all("img"):
+            for key in ("src", "data-src", "data-original", "data-lazy-src"):
+                u = img.get(key)
+                if u:
+                    urls.append(u)
+
+        for a in soup.find_all("a"):
+            u = a.get("href")
+            if u:
+                urls.append(u)
+
+        # 3) 正規化・フィルタ（image.codmon.com など画像配信URLのみ）
+        cleaned = []
+        for u in urls:
+            u = html.unescape(u) if u else u
+            u = (u or "").strip()
+            if not u:
+                continue
+            # 相対URLは無視（必要ならここで join する）
+            if u.startswith("//"):
+                u = "https:" + u
+            if not (u.startswith("http://") or u.startswith("https://")):
+                continue
+            # codmon 画像配信っぽいものに絞る（必要なら緩めてもOK）
+            if "image.codmon.com" not in u:
+                continue
+            cleaned.append(normalize_img_url(u) if "normalize_img_url" in globals() else u)
+
+        # 重複排除（順序保持）
+        seen = set()
+        uniq = []
+        for u in cleaned:
+            if u in seen:
+                continue
+            seen.add(u)
+            uniq.append(u)
+
+        return {base_date: uniq}
+    except Exception:
+        # 最悪でも落ちないように
+        try:
+            return {fallback_date or (now_dt.date() if hasattr(now_dt, "date") else dt.datetime.now().date()): []}
+        except Exception:
+            return {}
+
+
+
+def refetch_home_cards(driver):
+    """ホームのカード要素を毎回取り直す（stale対策）。"""
+    selectors = [
+        "div.homeCard",
+        "div[class*='homeCard']",
+    ]
+    for sel in selectors:
+        try:
+            cards = driver.find_elements(By.CSS_SELECTOR, sel)
+            if cards:
+                return cards
+        except Exception:
+            pass
+    return []
+
+
+def safe_click(driver: webdriver.Chrome, el, timeout: float = 5.0) -> bool:
+    """クリック安定化（scroll→待機→通常click→JS click→ActionChains）。"""
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
+    except Exception:
+        pass
+
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        try:
+            if el.is_displayed() and el.is_enabled():
+                break
+        except StaleElementReferenceException:
+            return False
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    try:
+        el.click()
+        return True
+    except (ElementClickInterceptedException, ElementNotInteractableException, WebDriverException):
+        pass
+    except StaleElementReferenceException:
+        return False
+
+    try:
+        driver.execute_script("arguments[0].click();", el)
+        return True
+    except Exception:
+        pass
+
+    try:
+        ActionChains(driver).move_to_element(el).pause(0.1).click(el).perform()
+        return True
+    except Exception:
+        return False
+
+def extract_date_text_from_card(driver, card):
+    """カードから日付テキストをできるだけ頑健に取得。見つからなければNone。"""
+    try:
+        for css in [
+            "div.homeCard_date span",
+            "div.homeCard_date",
+            "div[class*='homeCard_date'] span",
+            "div[class*='homeCard_date']",
+            "span[class*='homeCard_date']",
+        ]:
+            try:
+                el = card.find_element(By.CSS_SELECTOR, css)
+                t = (el.text or "").strip()
+                if t:
+                    return t
+            except Exception:
+                pass
+
+        try:
+            inner = driver.execute_script(
+                "return arguments[0].innerText || arguments[0].textContent || '';",
+                card
+            ) or ""
+        except Exception:
+            inner = (card.text or "")
+
+        inner = inner.strip()
+        if not inner:
+            return None
+
+        m = _MD_RE.search(inner)
+        if m:
+            return f"{int(m.group(1))}月{int(m.group(2))}日"
+
+        m = _REL_RE.search(inner)
+        if m:
+            return f"{m.group(1)}{m.group(2)}前"
+
+        if "昨日" in inner:
+            return "昨日"
+        if "今日" in inner:
+            return "今日"
+
+        return None
+    except StaleElementReferenceException:
+        return None
+
+def extract_date_text_from_detail(driver):
+    """詳細ページから日付テキストを取得（カードから取れない時の保険）。"""
+    for css in [
+        "div.diaryDetail_date",
+        "div.diaryDetail__date",
+        "div[class*='Detail'][class*='date']",
+        "div[class*='date']",
+    ]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, css)
+            t = (el.text or "").strip()
+            if t:
+                return t
+        except Exception:
+            pass
+
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+        m = _MD_RE.search(body)
+        if m:
+            return f"{int(m.group(1))}月{int(m.group(2))}日"
+    except Exception:
+        pass
+
+    return None
 
 def env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name, str(default)).strip().lower()
@@ -157,29 +392,84 @@ def login_and_get_cookies(email: str, password: str, headless: bool=True):
 
             # JavaScriptでinput要素を探して値を設定
             # HTMLから判明: .loginMain内の input[type="text"] と input[type="password"]
-            fill_result = driver.execute_script("""
-                // メールアドレス入力欄（type="text" で autocomplete="email"）
-                const emailInput = document.querySelector('.loginMain input[type="text"][autocomplete="email"]');
-                // パスワード入力欄（type="password" で autocomplete="current-password"）
-                const passInput = document.querySelector('.loginMain input[type="password"][autocomplete="current-password"]');
+            fill_result = driver.execute_script("""// Deep query (supports shadow DOM)
+function queryAllDeep(selector, root=document) {
+  const results = [];
+  const visit = (node) => {
+    if (!node) return;
+    try {
+      if (node.querySelectorAll) {
+        results.push(...node.querySelectorAll(selector));
+      }
+    } catch(e) {}
+    // traverse shadow roots
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, null);
+    let cur = walker.currentNode;
+    while (cur) {
+      if (cur.shadowRoot) visit(cur.shadowRoot);
+      cur = walker.nextNode();
+    }
+  };
+  visit(root);
+  // dedupe while preserving order
+  const seen = new Set();
+  return results.filter(el => {
+    if (!el) return false;
+    const k = el;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
 
-                console.log('Email input found:', !!emailInput);
-                console.log('Password input found:', !!passInput);
+function isVisible(el) {
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
 
-                if (emailInput && passInput) {
-                    emailInput.value = arguments[0];
-                    emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+function setNativeValue(el, value) {
+  const proto = Object.getPrototypeOf(el);
+  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  const setter = desc && desc.set ? desc.set : null;
+  if (setter) setter.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
 
-                    passInput.value = arguments[1];
-                    passInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    passInput.dispatchEvent(new Event('change', { bubbles: true }));
+const container = document.querySelector('.loginMain') || document;
+const inputs = queryAllDeep('input', container).filter(el => !el.disabled && el.type !== 'hidden' && isVisible(el));
 
-                    return {success: true, emailFound: true, passFound: true};
-                }
+let passInput = inputs.find(el => (el.type || '').toLowerCase() === 'password' || (el.getAttribute('autocomplete') || '').toLowerCase().includes('password'));
+let emailInput = inputs.find(el => {
+  const t = (el.type || '').toLowerCase();
+  const name = (el.name || '').toLowerCase();
+  const id = (el.id || '').toLowerCase();
+  const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+  const im = (el.getAttribute('inputmode') || '').toLowerCase();
+  const ph = (el.getAttribute('placeholder') || '');
+  return t === 'email' || ac === 'email' || im === 'email' || name.includes('mail') || id.includes('mail') || /メール|mail/i.test(ph);
+});
 
-                return {success: false, emailFound: !!emailInput, passFound: !!passInput};
-            """, email, password)
+// Fallback: first visible non-password input
+if (!emailInput) {
+  emailInput = inputs.find(el => el !== passInput && (el.type || '').toLowerCase() !== 'password');
+}
+
+const result = { emailFound: !!emailInput, passFound: !!passInput, success: false };
+
+if (emailInput && passInput) {
+  emailInput.focus();
+  setNativeValue(emailInput, arguments[0]);
+  passInput.focus();
+  setNativeValue(passInput, arguments[1]);
+  result.success = true;
+}
+
+return result;""", email, password)
 
             print(f"DEBUG: JavaScript入力結果: {fill_result}")
 
@@ -190,18 +480,46 @@ def login_and_get_cookies(email: str, password: str, headless: bool=True):
 
                 # 送信ボタンを探してクリック
                 # HTMLから判明: .loginMain__submit クラスの ons-button
-                submit_result = driver.execute_script("""
-                    const submitBtn = document.querySelector('.loginMain__submit');
+                submit_result = driver.execute_script("""const container = document.querySelector('.loginMain') || document;
+const candidates = [
+  '.loginMain__submit',
+  'button[type="submit"]',
+  'input[type="submit"]',
+  'button',
+  'input[type="button"]'
+];
 
-                    console.log('Submit button found:', !!submitBtn);
+function isVisible(el){
+  if (!el) return false;
+  const s = window.getComputedStyle(el);
+  if (s.display==='none' || s.visibility==='hidden' || s.opacity==='0') return false;
+  const r = el.getBoundingClientRect();
+  return r.width>0 && r.height>0;
+}
 
-                    if (submitBtn) {
-                        submitBtn.click();
-                        return {success: true, selector: '.loginMain__submit'};
-                    }
-
-                    return {success: false};
-                """)
+let btn = null;
+for (const sel of candidates){
+  const els = container.querySelectorAll(sel);
+  for (const el of els){
+    const t = (el.innerText || el.value || '').trim();
+    // Prefer explicit submit button or text containing "ログイン"
+    if (sel === '.loginMain__submit') { btn = el; break; }
+    if (/ログイン|Login|Sign in/i.test(t)) { btn = el; break; }
+  }
+  if (btn) break;
+}
+if (!btn){
+  // last resort: first visible button
+  const els = container.querySelectorAll('button, input[type="submit"], input[type="button"]');
+  for (const el of els){
+    if (isVisible(el) && !el.disabled){ btn = el; break; }
+  }
+}
+if (btn){
+  btn.click();
+  return { selector: btn.className || btn.tagName, success: true };
+}
+return { selector: null, success: false };""")
                 print(f"DEBUG: 送信結果: {submit_result}")
                 time.sleep(3)
                 driver.save_screenshot(str(debug_dir / "04_after_submit.png"))
@@ -250,54 +568,48 @@ def login_and_get_cookies(email: str, password: str, headless: bool=True):
 
     return driver, sess
 
-def human_time_to_dt(text: str) -> dt.datetime | None:
-    """
-    人間可読な時刻表記をdatetimeに変換
-    対応形式:
-    - "20時間前", "3日前", "10分前"
-    - "9月29日"
-    - "2025年9月30日16時10分31秒"
-    """
-    now = dt.datetime.now()
+def human_time_to_dt(text: str, now: dt.datetime | None = None) -> dt.datetime | None:
+    """Convert Codmon home-card time label to datetime.
 
-    # パターン1: "◯時間前", "◯日前", "◯分前"
-    m = re.match(r"(\d+)\s*(分|時間|日)前", text)
+    Supported inputs:
+      - Relative: '21時間前', '5分前', '3日前' など
+      - Absolute (no year): '1月23日' など（年は `now.year` とみなす）
+
+    Returns None if parse fails.
+    """
+    if not text:
+        return None
+
+    if now is None:
+        now = dt.datetime.now()
+
+    t = text.strip()
+
+    # Relative time patterns (Japanese)
+    m = re.match(r"^(\d+)\s*分前$", t)
     if m:
-        val = int(m.group(1))
-        unit = m.group(2)
-        if unit == "分":
-            return now - dt.timedelta(minutes=val)
-        if unit == "時間":
-            return now - dt.timedelta(hours=val)
-        if unit == "日":
-            return now - dt.timedelta(days=val)
+        return now - dt.timedelta(minutes=int(m.group(1)))
 
-    # パターン2: "9月29日" または "9月9日"
-    # 時刻情報がないので、現在時刻と同じ時刻と仮定
-    m = re.match(r"(\d+)月(\d+)日", text)
+    m = re.match(r"^(\d+)\s*時間前$", t)
+    if m:
+        return now - dt.timedelta(hours=int(m.group(1)))
+
+    m = re.match(r"^(\d+)\s*日前$", t)
+    if m:
+        return now - dt.timedelta(days=int(m.group(1)))
+
+    # Absolute date: 'M月D日' optionally with weekday like '(金)'
+    m = re.match(r"^(\d{1,2})月(\d{1,2})日", t)
     if m:
         month = int(m.group(1))
         day = int(m.group(2))
-        year = now.year
-        # 未来の日付になる場合は前年とする
-        target_date = dt.datetime(year, month, day, now.hour, now.minute, now.second)
-        if target_date > now:
-            target_date = dt.datetime(year - 1, month, day, now.hour, now.minute, now.second)
-        return target_date
-
-    # パターン3: "2025年9月30日16時10分31秒"
-    m = re.match(r"(\d{4})年(\d+)月(\d+)日(\d+)時(\d+)分(\d+)秒", text)
-    if m:
-        year = int(m.group(1))
-        month = int(m.group(2))
-        day = int(m.group(3))
-        hour = int(m.group(4))
-        minute = int(m.group(5))
-        second = int(m.group(6))
-        return dt.datetime(year, month, day, hour, minute, second)
+        try:
+            # Use end-of-day to avoid excluding same-day posts when only date is shown
+            return dt.datetime(now.year, month, day, 23, 59, 59)
+        except ValueError:
+            return None
 
     return None
-
 def rewrite_width(url: str, width_value: int) -> str:
     p = urlparse(url)
     q = parse_qs(p.query)
@@ -363,11 +675,73 @@ def download_with_fallback(sess: requests.Session, url: str, out_path: Path, max
 
     raise RuntimeError(f"ダウンロード失敗: {url}")
 
+
+
+def safe_go_back(driver: webdriver.Chrome, wait_timeout: int = 10) -> None:
+    """詳細ページからホーム（カード一覧）に戻る。
+
+    onsen-ui の back ボタンが存在しない/非表示の場合があるため、
+    (1) 画面上に存在する「戻る/閉じる」系のボタンを素早く探してクリック
+    (2) ダメなら history.back()
+    (3) 最後にホームカードが表示されるまで待機
+    """
+    # なるべく待たずに存在チェック → 表示されていればクリック
+    candidates = [
+        "ons-back-button",
+        "button[aria-label*='戻']",
+        "button[aria-label*='back']",
+        "button[aria-label*='閉']",
+        "button[aria-label*='close']",
+        "button[class*='back']",
+        "button[class*='Back']",
+        "a[class*='back']",
+        "a[class*='Back']",
+        "div[class*='back'] button",
+    ]
+
+    clicked = False
+    for sel in candidates:
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in elems:
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        driver.execute_script("arguments[0].click();", el)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        try:
+            driver.execute_script("window.history.back();")
+        except Exception:
+            try:
+                driver.back()
+            except Exception:
+                pass
+
+    # ホームに戻ったことの確認（1回だけ待つ）
+    try:
+        WebDriverWait(driver, wait_timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.homeCard, div[class*='homeCard']"))
+        )
+    except Exception:
+        # ここで失敗しても致命ではない（次の refetch で復帰する可能性がある）
+        pass
 def collect_image_urls_from_home(driver, lookback_hours: int, scroll_steps: int, scroll_wait: float) -> list[tuple[str, dt.datetime|None, str|None]]:
+    items: list[tuple[str, dt.datetime|None, str|None]] = []
+    
     driver.get(HOME_URL)
     time.sleep(3)
 
-    end_threshold = dt.datetime.now() - dt.timedelta(hours=lookback_hours)
+    now = dt.datetime.now()
+    end_threshold = now - dt.timedelta(hours=lookback_hours)
     print(f"DEBUG: 閾値時刻: {end_threshold.strftime('%Y-%m-%d %H:%M:%S')}")
 
     urls: list[tuple[str, dt.datetime|None, str|None]] = []
@@ -387,140 +761,82 @@ def collect_image_urls_from_home(driver, lookback_hours: int, scroll_steps: int,
         soup = BeautifulSoup(current_html, "html.parser")
 
         # カード要素を取得（画像を含むカード）
-        # カードはクリック可能な要素で、.homeCard_date を持つ
-        card_elements = driver.find_elements(By.CSS_SELECTOR, "div.homeCard_date")
-
-        print(f"DEBUG: 見つかったカード数: {len(card_elements)}")
+        # ホーム画面のカード全体を取得（homeCardクラス）
+        try:
+            home_card_elements = driver.find_elements(By.CSS_SELECTOR, "div.homeCard")
+        except Exception:
+            home_card_elements = []
+        print(f"DEBUG: 見つかったカード数: {len(home_card_elements)}")
 
         # 現在の画面に閾値を超えるカードがいくつあるかカウント
         over_threshold_count = 0
 
-        # ホーム画面のカード全体を取得（homeCardクラス）
-        home_card_elements = driver.find_elements(By.CSS_SELECTOR, "div.homeCard")
         print(f"DEBUG: 見つかったホームカード数: {len(home_card_elements)}")
 
-        for home_card in home_card_elements:
+        
+        # stale対策のため、カードをindexで処理し、毎回取り直す
+        base_cards = refetch_home_cards(driver)
+        print(f"DEBUG: 見つかったカード数: {len(base_cards)}")
+
+        for card_idx in range(len(base_cards)):
             try:
-                # カード内の日付要素を探す
-                try:
-                    date_el = home_card.find_element(By.CSS_SELECTOR, "div.homeCard_date span")
-                    date_text = date_el.text.strip()
-                except:
-                    print("DEBUG: 日付要素が見つかりません、スキップ")
-                    continue
+                cards_now = refetch_home_cards(driver)
+                if card_idx >= len(cards_now):
+                    break
+                home_card = cards_now[card_idx]
 
-                post_dt = human_time_to_dt(date_text)
-                print(f"DEBUG: カード日時: {date_text} -> {post_dt}")
+                date_text = extract_date_text_from_card(driver, home_card)
+                if not date_text:
+                    print("DEBUG: 日付要素が見つかりません（カード内）、詳細から取得を試行します")
 
-                # カードの一意識別子を取得（重複処理防止）
-                # タイトルと日付を組み合わせて一意のIDとする
-                try:
-                    title_el = home_card.find_element(By.CSS_SELECTOR, "div.homeCard__title")
-                    card_id = f"{date_text}_{title_el.text[:50]}"
-                except:
-                    card_id = date_text
-
-                if card_id in processed_cards:
-                    print(f"DEBUG: 処理済みカードをスキップ: {card_id[:50]}")
-                    continue
-
-                # LOOKBACK_HOURSの閾値チェック
+                post_dt = human_time_to_dt(date_text, now) if date_text else None
                 if post_dt and post_dt < end_threshold:
-                    print(f"DEBUG: 閾値を超えたのでスキップ: {date_text}")
-                    processed_cards.add(card_id)
                     over_threshold_count += 1
+
+                # 詳細へ遷移（interactable/intercepted/stale 対策）
+                try:
+                    if not safe_click(driver, home_card, timeout=5.0):
+                        print("DEBUG: カードクリックに失敗しました、スキップ")
+                        continue
+                except StaleElementReferenceException:
                     continue
 
-                # この時点で閾値内の投稿のみ処理
-                processed_cards.add(card_id)
-                print(f"DEBUG: 処理対象のカード: {date_text} - {card_id[:50]}")
+                time.sleep(0.8)
+                detail_html = driver.page_source
 
-                # カードをクリックして詳細画面へ
-                print("DEBUG: カードをクリック中...")
-                driver.execute_script("arguments[0].scrollIntoView(true);", home_card)
-                time.sleep(0.5)
-                home_card.click()
-                time.sleep(3)  # 詳細画面の読み込みを待つ
+                if post_dt is None:
+                    detail_date_text = extract_date_text_from_detail(driver)
+                    if detail_date_text:
+                        post_dt = human_time_to_dt(detail_date_text, now)
 
-                # 詳細画面のHTMLを取得
-                detail_html = driver.execute_script("return document.documentElement.outerHTML;")
-                detail_soup = BeautifulSoup(detail_html, "html.parser")
+                if post_dt is None:
+                    print("DEBUG: 日付を特定できません（カード/詳細ともに）。このカードはスキップします")
+                    safe_go_back(driver)
+                    time.sleep(0.6)
+                    continue
 
-                # 詳細画面内の現在表示されている投稿の画像のみを取得
-                # カルーセルのactive状態の画像のみを取得するか、全画像を取得
-                # まず、詳細画面のタイトルを確認して現在の投稿を特定
-                try:
-                    detail_title_el = detail_soup.select_one("div.diaryDetailTitle")
-                    if detail_title_el:
-                        detail_title = detail_title_el.get_text(strip=True)
-                        print(f"DEBUG: 詳細画面タイトル: {detail_title[:50]}")
-                except:
-                    pass
+                print(f"DEBUG: 処理対象の日付: {post_dt.date()} / カード: {date_text or '(detail)'}_{card_idx}_")
 
-                # 現在の投稿に属する画像を取得
-                # 1. カルーセル内の画像を取得
-                detail_imgs = detail_soup.select("ons-carousel ons-carousel-item img")
-                print(f"DEBUG: カルーセル内の画像数: {len(detail_imgs)}")
+                groups = group_images_by_date(detail_html, now, fallback_date=post_dt.date())
+                for d, ulist in groups.items():
+                    if not ulist:
+                        continue
+                    # 日付ごとの一覧（ログ用・重複排除用）
+                    items.append((d, ulist))
+                    # 後段のDL処理用にフラット化
+                    for u in ulist:
+                        urls.append((u, dt.datetime.combine(d, dt.time(23, 59, 59)), f"{d.isoformat()}_{card_idx}"))
 
-                # 2. notebookPreview_meal_pic内の画像も取得
-                meal_imgs = detail_soup.select("div.notebookPreview_meal_pic img")
-                print(f"DEBUG: 食事画像数: {len(meal_imgs)}")
-
-                # この投稿の画像URLリスト
-                post_image_urls = []
-                for img in detail_imgs:
-                    src = (img.get("src") or "").strip()
-                    if src.startswith(IMG_HOST_PREFIX):
-                        post_image_urls.append(src)
-
-                # 食事画像も追加
-                for img in meal_imgs:
-                    src = (img.get("src") or "").strip()
-                    if src.startswith(IMG_HOST_PREFIX):
-                        post_image_urls.append(src)
-
-                # 最初の画像URLから投稿IDを取得（diary_idを持つもの）
-                diary_id = None
-                for url in post_image_urls:
-                    diary_match = re.search(r'/diaries/(\d+)/', url)
-                    if diary_match:
-                        diary_id = diary_match.group(1)
-                        print(f"DEBUG: 投稿ID: {diary_id}")
-                        break
-
-                # 画像を収集（diary_idがあればそれを使用、なければNone）
-                for url in post_image_urls:
-                    # diary_idがある場合、/diaries/{diary_id}/を含む画像のみフィルタ
-                    # /comments/のパスを持つ画像は同じカードに属するためdiary_idを関連付ける
-                    if diary_id and '/diaries/' in url:
-                        if f'/diaries/{diary_id}/' in url:
-                            urls.append((url, post_dt, diary_id))
-                            print(f"DEBUG: 画像URL取得 (ID:{diary_id}): {url[:80]}...")
-                    else:
-                        # commentsパスの画像、またはdiary_idがない場合
-                        urls.append((url, post_dt, diary_id))
-                        print(f"DEBUG: 画像URL取得 (ID:{diary_id or 'なし'}): {url[:80]}...")
-
-                # 戻るボタンをクリック
-                print("DEBUG: 戻るボタンをクリック中...")
-                back_btn = driver.find_element(By.CSS_SELECTOR, "ons-back-button")
-                back_btn.click()
-                time.sleep(2)  # ホーム画面への戻りを待つ
+                safe_go_back(driver)
+                time.sleep(0.8)
 
             except Exception as e:
                 print(f"DEBUG: カード処理エラー: {e}")
-                # エラーが起きたら戻るボタンを試す
-                try:
-                    back_btn = driver.find_element(By.CSS_SELECTOR, "ons-back-button")
-                    back_btn.click()
-                    time.sleep(2)
-                except:
-                    pass
                 continue
 
         # 閾値を超えたカードが多い場合（画面の半分以上）、スクロールを停止
-        print(f"DEBUG: 閾値超過カード数: {over_threshold_count}/{len(card_elements)}")
-        if len(card_elements) > 0 and over_threshold_count >= len(card_elements) / 2:
+        print(f"DEBUG: 閾値超過カード数: {over_threshold_count}/{len(home_card_elements)}")
+        if len(home_card_elements) > 0 and over_threshold_count >= len(home_card_elements) / 2:
             print("DEBUG: 画面の半分以上が閾値を超えたため、スクロールを停止します")
             should_stop = True
             continue  # 次のスクロールループで終了
